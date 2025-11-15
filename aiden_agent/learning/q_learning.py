@@ -102,9 +102,12 @@ class QLearningSystem:
         return reward
     
     def update_q_value(self, context, action, reward):
-        """Q-learning update rule"""
+        """Q-learning update rule with intrinsic reward support"""
+        # Clamp reward for safety
+        total_reward = max(min(reward, 10), -10)
+        
         current_q = self.q_table[context][action.value]
-        new_q = current_q + self.alpha * (reward - current_q)
+        new_q = current_q + self.alpha * (total_reward - current_q)
         self.q_table[context][action.value] = new_q
     
     def record_experience(self, context, action, reward):
@@ -165,3 +168,24 @@ class QLearningSystem:
             return "declining"
         else:
             return "stable"
+    
+    def compute_intrinsic_reward(self, agent):
+        """Compute intrinsic motivation rewards based on self-model"""
+        r = 0.0
+        
+        # Novelty
+        if agent.self_model.novelty_history:
+            r += agent.self_model.novelty_history[-1] * 0.5
+        
+        # Repetition penalty
+        r -= agent.self_model.action_repetition_index * 0.7
+        
+        # Terrain awareness
+        terrain = agent.environment.grid_world.get_cell(agent.position_x, agent.position_y).terrain.value
+        if terrain in agent.self_model.terrain_preferences:
+            if agent.self_model.terrain_preferences[terrain] == "favorable":
+                r += 0.3
+            else:
+                r -= 0.3
+        
+        return r

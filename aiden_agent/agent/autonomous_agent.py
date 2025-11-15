@@ -14,7 +14,7 @@ from aiden_agent.cognition import PersonalityProfile, MotivationType, Reflection
 from aiden_agent.learning import QLearningSystem
 from aiden_agent.goals import GoalManager
 from aiden_agent.agent.actions import Action, ActionResult
-
+from aiden_agent.cognition.self_model import SelfModel
 
 class AutonomousAgent:
     """
@@ -96,6 +96,10 @@ class AutonomousAgent:
         self.last_reflection = 0
         self.last_personality_display = 0
     
+        # ===== SELF-MODELING LAYER =====
+        self.self_model = SelfModel(history_size=50)
+        self.last_self_model_display = 0
+    
     # ========================================
     # COGNITIVE DRIFT - PERSONALITY INFLUENCE
     # ========================================
@@ -129,6 +133,12 @@ class AutonomousAgent:
         # Clamp all motivations 0-1
         for mot_type in self.motivation_levels:
             self.motivation_levels[mot_type] = max(0.0, min(1.0, self.motivation_levels[mot_type]))
+        
+        # PATCH 6: Normalize Motivations After Personality Multipliers
+        total = sum(self.motivation_levels.values())
+        if total > 1:
+            for k in self.motivation_levels:
+                self.motivation_levels[k] /= total
     
     def apply_optimism_to_happiness_recovery(self, base_recovery):
         """
@@ -145,8 +155,9 @@ class AutonomousAgent:
         """
         Analyze long_term_memory and RL data to generate introspective reflections
         NOW ALSO MUTATES PERSONALITY based on insights
+        NOW INCLUDES SELF-MODEL INTROSPECTION
         
-        Returns: (reflection_string, personality_mutations)
+        Returns: (reflection_string, personality_mutations, introspective_summary)
         """
         reflection_text, reward_trend, failure_count, success_count = ReflectionSystem.self_reflect_from_memory(
             self.long_term_memory, 
@@ -156,6 +167,13 @@ class AutonomousAgent:
             self.cycles_alive,
             self.personality
         )
+        
+        # ===== SELF-MODEL CAUSE-EFFECT ANALYSIS =====
+        new_patterns = self.self_model.analyze_cause_effect()
+        
+        if new_patterns:
+            pattern_summary = f" Discovered {len(new_patterns)} new behavioral patterns."
+            reflection_text += pattern_summary
         
         # ===== COGNITIVE DRIFT: PERSONALITY MUTATION =====
         # Determine dominant motivation
@@ -172,16 +190,21 @@ class AutonomousAgent:
         # Record snapshot
         self.personality.record_snapshot(self.cycles_alive)
         
-        # Store reflection in memory
+        # ===== GENERATE INTROSPECTIVE SUMMARY =====
+        introspective_summary = ReflectionSystem.generate_introspective_summary(self, self.self_model)
+        
+        # Store reflection in memory with introspection
         self.long_term_memory["reflections"].append({
             "cycle": self.cycles_alive,
             "type": "self_analysis",
             "text": reflection_text,
             "personality_mutations": mutations,
-            "archetype": self.personality.get_personality_archetype()
+            "archetype": self.personality.get_personality_archetype(),
+            "self_narrative": self.self_model.generate_self_narrative(),
+            "detected_patterns": len(new_patterns)
         })
         
-        return reflection_text, mutations
+        return reflection_text, mutations, introspective_summary
     
     # ========================================
     # MEMORY MANAGEMENT (Enhanced with Personality)
@@ -210,6 +233,12 @@ class AutonomousAgent:
                         print(f"\n🧠 Personality Profile Loaded: {archetype}")
                         print(f"   Optimism: {self.personality.optimism:.2f} | Discipline: {self.personality.discipline:.2f}")
                         print(f"   Curiosity: {self.personality.curiosity_bias:.2f} | Risk: {self.personality.risk_tolerance:.2f}")
+                    
+                    # Load self-model state
+                    if "self_model" in data:
+                        self.self_model = SelfModel.from_dict(data["self_model"])
+                        print(f"    🧠 Self-Model: {len(self.self_model.detected_patterns)} patterns detected")
+                        print(f"         Fatigue Score: {self.self_model.fatigue_cause_score:.2f} | Environment Sensitivity: {self.self_model.environment_sensitivity:.2f}")
                     
                     # Load spatial state
                     if "position" in data:
@@ -252,7 +281,10 @@ class AutonomousAgent:
             # Convert Q-table
             q_table_serializable = {}
             for context in self.rl_system.q_table:
-                q_table_serializable[context] = dict(self.rl_system.q_table[context])
+                # PATCH 5: Ensure Q-table Action Keys Serialize as Strings
+                q_table_serializable[context] = {}
+                for action, q_value in self.rl_system.q_table[context].items():
+                    q_table_serializable[context][str(action)] = float(q_value)
             
             data = {
                 "total_actions": dict(self.long_term_memory["total_actions"]),
@@ -272,7 +304,12 @@ class AutonomousAgent:
                 "inventory": {r.value: count for r, count in self.inventory.items()},
                 "grid_world": self.environment.grid_world.to_dict(),
                 "goal_system": self.goal_manager.to_dict(),
+                "self_model": self.self_model.to_dict(),
                 "personality_profile": self.personality.to_dict(),  # SAVE PERSONALITY
+                
+                # PATCH 4 (Part 1)
+                "intrinsic_rewards": getattr(self, "intrinsic_rewards", []),
+                
                 "last_saved": datetime.now().isoformat()
             }
             
@@ -295,7 +332,7 @@ class AutonomousAgent:
         if not current_cell.discovered:
             current_cell.discovered = True
             self.cells_discovered += 1
-            world_state["events"].append(f"🗺  Discovered new terrain: {current_cell.terrain.value}!")
+            world_state["events"].append(f"🗺   Discovered new terrain: {current_cell.terrain.value}!")
             
             self.long_term_memory["cells_explored"].append({
                 "cycle": self.cycles_alive,
@@ -431,15 +468,67 @@ class AutonomousAgent:
         self.apply_personality_to_motivations()
     
     def decide_action(self, world_state, spatial_context):
-        """Choose action using RL with spatial context"""
+        """Choose action using RL with spatial context and self-model biases"""
         agent_state = self.get_internal_state()
         context = self.rl_system.get_context(agent_state, world_state, spatial_context)
         
         # All available actions
         available_actions = list(Action)
         
-        # Let RL choose
-        chosen_action = self.rl_system.choose_action(context, available_actions)
+        # Get Q-values or scores for all actions
+        action_scores = {}
+        for action in available_actions:
+            # Get base Q-value from RL system
+            score = self.rl_system.q_table[context].get(action.value, 0.0)
+            
+            # ===== PATCH A: ADD BIASES USING SELF-MODEL INSIGHTS =====
+            
+            # Avoid studying when energy < 40
+            if action == Action.STUDY and self.energy < 40:
+                score -= 3.0
+            
+            # Avoid repeating the same action if repetition index > 0.4
+            if self.previous_action is not None and self.self_model.action_repetition_index > 0.4:
+                if action.value == self.previous_action.value:
+                    score -= 2.5
+            
+            # Prefer movement when novelty is low
+            if action.name.startswith("MOVE"):
+                recent = list(self.self_model.novelty_history)[-5:]
+                if recent:
+                    novelty_avg = sum(recent) / len(recent)
+                else:
+                    novelty_avg = 0.0
+                score += novelty_avg * 2.0
+            
+            # Prefer favorable terrains from self_model
+            current_terrain = self.environment.grid_world.get_cell(self.position_x, self.position_y).terrain.value
+            if current_terrain in self.self_model.terrain_preferences:
+                if self.self_model.terrain_preferences[current_terrain] == "favorable":
+                    score += 1.5
+                elif self.self_model.terrain_preferences[current_terrain] == "unfavorable":
+                    score -= 2.0
+            
+            # PATCH 1: Add Fatigue-Avoidance Bias (Missing part of PATCH A)
+            # Avoid actions that historically contribute to fatigue
+            if action in [Action.EXERCISE, Action.EXPLORE] and self.self_model.fatigue_cause_score > 0.6:
+                score -= 2.0
+
+            # PATCH 2: Add Environment Sensitivity Penalty (Missing part of PATCH B)
+            # Penalize actions during unfavourable environmental conditions
+            if self.self_model.environment_sensitivity > 0.5:
+                if world_state.get("weather") != "sunny":
+                    score -= 1.5
+                if spatial_context.get("hazard_level", 0) > 0:
+                    score -= self.self_model.environment_sensitivity * 2
+            
+            action_scores[action] = score
+        
+        # Choose action with highest score (with epsilon-greedy exploration)
+        if random.random() < self.rl_system.epsilon:
+            chosen_action = random.choice(available_actions)
+        else:
+            chosen_action = max(action_scores.items(), key=lambda x: x[1])[0]
         
         # Store for reward calculation
         self.previous_context = context
@@ -631,8 +720,8 @@ class AutonomousAgent:
                 effects = {"energy": 0}
                 message = "Too tired for deep reflection"
             else:
-                # Reflection with personality mutation
-                reflection_text, personality_mutations = self.self_reflect_from_memory()
+                # Reflection with personality mutation AND self-model introspection
+                reflection_text, personality_mutations, introspective_summary = self.self_reflect_from_memory()
                 
                 focus_gain = 15
                 happiness_gain = 10
@@ -645,12 +734,16 @@ class AutonomousAgent:
                 self.last_reflection = self.cycles_alive
                 
                 effects = {"focus": focus_gain, "happiness": happiness_bonus, "energy": -5}
-                message = f"💭 Reflected deeply. {reflection_text[:100]}..."
+                message = f"💭 Reflected deeply. {reflection_text[:80]}..."
                 
                 # Display personality mutations if significant
                 if personality_mutations:
                     mut_summary = ", ".join([f"{k}: {v}" for k, v in list(personality_mutations.items())[:2]])
                     message += f"\n   🧩 Personality shift → {mut_summary}"
+                
+                # Display self-model insights
+                if introspective_summary:
+                    print("\n" + introspective_summary)
         
         # ===== SOCIALIZE =====
         elif action == Action.SOCIALIZE:
@@ -784,6 +877,12 @@ class AutonomousAgent:
         # Execute action
         result, spatial_bonus = self.execute_action(action, world_state, spatial_context)
         
+        # ===== PATCH B: RECORD STATE IN SELF-MODEL =====
+        self.self_model.record_state(self)
+        
+        # ===== PATCH B: ANALYZE CAUSE-EFFECT PATTERNS =====
+        self.self_model.analyze_cause_effect()
+        
         # Calculate reward
         reward = self.rl_system.calculate_reward(
             result.effects,
@@ -792,6 +891,37 @@ class AutonomousAgent:
             spatial_bonus=spatial_bonus,
             goal_bonus=goal_bonus
         )
+        
+        # ===== PATCH C: ADD INTRINSIC REWARD INJECTION =====
+        intrinsic_bonus = 0.0
+        
+        # Novelty reward
+        if self.self_model.novelty_history:
+            intrinsic_bonus += self.self_model.novelty_history[-1] * 0.8
+        
+        # Repetition penalty
+        intrinsic_bonus -= self.self_model.action_repetition_index * 0.8
+        
+        # Fatigue penalty
+        if self.energy < 35:
+            intrinsic_bonus -= 0.5
+        
+        # PATCH 3: Add Positive Pattern Intrinsic Reward (Missing part of PATCH C)
+        # Positive intrinsic reward from discovered helpful patterns
+        positive_bonus = 0.0
+        if self.previous_action: # Ensure action exists (not first cycle)
+            positive_bonus = self.self_model.get_positive_pattern_reward(self.previous_action)
+        intrinsic_bonus += positive_bonus
+        
+        # PATCH 4 (Part 2): Save Intrinsic Reward History
+        if not hasattr(self, "intrinsic_rewards"):
+            self.intrinsic_rewards = []
+        self.intrinsic_rewards.append({
+            "cycle": self.cycles_alive,
+            "intrinsic_bonus": intrinsic_bonus
+        })
+        
+        reward += intrinsic_bonus
         
         # Update Q-learning
         if self.previous_context and self.previous_action:
@@ -805,6 +935,11 @@ class AutonomousAgent:
         if self.cycles_alive % 10 == 0 or (self.cycles_alive - self.last_personality_display) >= 10:
             self.personality.display_summary()
             self.last_personality_display = self.cycles_alive
+        
+        # Periodic self-model display
+        if self.cycles_alive % 10 == 0:
+            print("\n" + self.self_model.get_self_awareness_summary() + "\n")
+            self.last_self_model_display = self.cycles_alive
         
         # Decay personality toward neutral if inactive for long periods
         self.personality.cycles_since_activity += 1
@@ -894,7 +1029,7 @@ class AutonomousAgent:
         
         print(f"⏰ Cycles Survived: {self.cycles_alive}")
         print(f"📍 Final Position: ({self.position_x}, {self.position_y})")
-        print(f"🗺️  Cells Explored: {self.cells_discovered}/25")
+        print(f"🗺️   Cells Explored: {self.cells_discovered}/25")
         print(f"🧠 Total Knowledge: {self.knowledge:.1f}")
         print(f"😊 Final Happiness: {self.happiness:.1f}/100")
         print(f"💚 Final Energy: {self.energy:.1f}/100\n")
@@ -926,6 +1061,16 @@ class AutonomousAgent:
             top_topics = sorted(self.learned_topics.items(), key=lambda x: x[1], reverse=True)[:5]
             for topic, count in top_topics:
                 print(f"   • {topic}: studied {count} times")
+        
+        # Self-Model Final Analysis
+        print(f"\n🧠 SELF-MODEL FINAL ANALYSIS:")
+        print(self.self_model.get_self_awareness_summary())
+        
+        # Self-narrative
+        narrative = self.self_model.generate_self_narrative()
+        print(f"\n📖 Final Self-Narrative:")
+        print(f'   "{narrative}"')
+        print()
         
         # Final personality state
         print(f"\n🧬 FINAL PERSONALITY PROFILE:")
