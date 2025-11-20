@@ -15,6 +15,7 @@ from aiden_agent.learning import QLearningSystem
 from aiden_agent.goals import GoalManager
 from aiden_agent.agent.actions import Action, ActionResult
 from aiden_agent.cognition.self_model import SelfModel
+from aiden_agent.cognition.meta_controller import MetaController
 
 class AutonomousAgent:
     """
@@ -99,6 +100,9 @@ class AutonomousAgent:
         # ===== SELF-MODELING LAYER =====
         self.self_model = SelfModel(history_size=50)
         self.last_self_model_display = 0
+
+        # ===== META-COGNITION =====
+        self.meta_controller = MetaController()
     
     # ========================================
     # COGNITIVE DRIFT - PERSONALITY INFLUENCE
@@ -238,7 +242,7 @@ class AutonomousAgent:
                     if "self_model" in data:
                         self.self_model = SelfModel.from_dict(data["self_model"])
                         print(f"    🧠 Self-Model: {len(self.self_model.detected_patterns)} patterns detected")
-                        print(f"         Fatigue Score: {self.self_model.fatigue_cause_score:.2f} | Environment Sensitivity: {self.self_model.environment_sensitivity:.2f}")
+                        print(f"        Fatigue Score: {self.self_model.fatigue_cause_score:.2f} | Environment Sensitivity: {self.self_model.environment_sensitivity:.2f}")
                     
                     # Load spatial state
                     if "position" in data:
@@ -267,9 +271,9 @@ class AutonomousAgent:
                         self.goal_manager = GoalManager.from_dict(data["goal_system"])
                     
                     print(f"[Memory] Loaded world state from previous session")
-                    print(f"         Position: ({self.position_x}, {self.position_y})")
-                    print(f"         Cells discovered: {self.cells_discovered}")
-                    print(f"         Active goals: {len(self.goal_manager.active_goals)}\n")
+                    print(f"        Position: ({self.position_x}, {self.position_y})")
+                    print(f"        Cells discovered: {self.cells_discovered}")
+                    print(f"        Active goals: {len(self.goal_manager.active_goals)}\n")
                     
             except Exception as e:
                 print(f"[Memory] Load error: {e}")
@@ -874,7 +878,22 @@ class AutonomousAgent:
         # Decide action
         action = self.decide_action(world_state, spatial_context)
         
-        # Execute action
+        # ===== META-CONTROLLER INTERVENTION =====
+        proposed_action = action
+        
+        final_action_value, reason = self.meta_controller.evaluate(
+            self,
+            proposed_action.value,
+            self.self_model
+        )
+
+        self.last_override_reason = reason
+        if final_action_value != proposed_action.value:
+            print(f"⚠️ Meta-Controller Override → {final_action_value} ({reason})")
+            # Update action variable to ensure correct execution and logging
+            action = Action(final_action_value)
+
+        # Execute action (using final_action)
         result, spatial_bonus = self.execute_action(action, world_state, spatial_context)
         
         # ===== PATCH B: RECORD STATE IN SELF-MODEL =====
