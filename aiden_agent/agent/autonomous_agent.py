@@ -17,6 +17,7 @@ from aiden_agent.agent.actions import Action, ActionResult
 from aiden_agent.cognition.self_model import SelfModel
 from aiden_agent.cognition.meta_controller import MetaController
 from aiden_agent.cognition.global_planner import GlobalPlanner
+from aiden_agent.cognition.intent_engine import IntentionEngine
 
 class AutonomousAgent:
     """
@@ -105,6 +106,9 @@ class AutonomousAgent:
         # ===== META-COGNITION =====
         self.meta_controller = MetaController()
         self.global_planner = GlobalPlanner()
+        
+        self.intention_engine = IntentionEngine()
+        self.current_intention = None
     
     # ========================================
     # COGNITIVE DRIFT - PERSONALITY INFLUENCE
@@ -356,9 +360,18 @@ class AutonomousAgent:
         # Build spatial context for RL
         spatial_context = {
             "terrain": current_cell.terrain.value,
+            "terrain_type": current_cell.terrain,                   # NEW
+            "position": (self.position_x, self.position_y),         # NEW
+
+            # Neighbor terrain map
+            "neighbors": {
+                direction: cell.terrain.value
+                for direction, cell in neighbors.items()
+            },
+
             "nearby_resources": nearby_resources,
             "resources_here": len(current_cell.resources),
-            "hazard_level": self.environment.get_hazard_level()
+            "hazard_level": self.environment.get_hazard_level(),
         }
         
         # Record observation
@@ -389,6 +402,10 @@ class AutonomousAgent:
         
         return world_state, spatial_context
     
+    def get_current_cell(self):
+        """Return the grid cell the agent is currently standing on."""
+        return self.environment.grid_world.get_cell(self.position_x, self.position_y)
+
     def get_internal_state(self):
         """Get internal state for RL"""
         return {
@@ -846,6 +863,22 @@ class AutonomousAgent:
         # Update motivations (with personality influence)
         self.update_motivations(world_state, spatial_context)
         
+        # ===== PHASE 5: INTENTION ENGINE =====
+        self.current_intention = self.intention_engine.evaluate(
+            self,
+            world_state,
+            spatial_context
+        )
+
+        intention_action = self.intention_engine.suggest_action(
+            self.current_intention,
+            self,
+            world_state,
+            spatial_context
+        )
+        # ===== INTENTION DEBUG DASHBOARD =====
+        self.intention_engine.debug_dashboard()
+        
         # Goal system
         agent_state = self.get_internal_state()
         spatial_state = self.get_spatial_state()
@@ -888,9 +921,15 @@ class AutonomousAgent:
             try:
                 proposed_action = Action[strategic_action.upper()]
             except KeyError:
-                proposed_action = chosen_action   # fallback
+                if intention_action and intention_action.upper() in Action.__members__:
+                    proposed_action = Action[intention_action.upper()]
+                else:
+                    proposed_action = chosen_action
         else:
-            proposed_action = chosen_action
+            if intention_action and intention_action.upper() in Action.__members__:
+                proposed_action = Action[intention_action.upper()]
+            else:
+                proposed_action = chosen_action
 
         
         # ===== META-CONTROLLER INTERVENTION =====
@@ -932,10 +971,13 @@ class AutonomousAgent:
         
         # Novelty reward
         if self.self_model.novelty_history:
-            intrinsic_bonus += self.self_model.novelty_history[-1] * 0.8
+            intrinsic_bonus += self.self_model.novelty_history[-1] * 2.0
         
         # Repetition penalty
         intrinsic_bonus -= self.self_model.action_repetition_index * 0.8
+        
+        if self.self_model.action_repetition_index > 0.4:
+            intrinsic_bonus += 1.2
         
         # Fatigue penalty
         if self.energy < 35:
