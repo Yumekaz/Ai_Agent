@@ -16,6 +16,7 @@ from aiden_agent.goals import GoalManager
 from aiden_agent.agent.actions import Action, ActionResult
 from aiden_agent.cognition.self_model import SelfModel
 from aiden_agent.cognition.meta_controller import MetaController
+from aiden_agent.cognition.global_planner import GlobalPlanner
 
 class AutonomousAgent:
     """
@@ -103,6 +104,7 @@ class AutonomousAgent:
 
         # ===== META-COGNITION =====
         self.meta_controller = MetaController()
+        self.global_planner = GlobalPlanner()
     
     # ========================================
     # COGNITIVE DRIFT - PERSONALITY INFLUENCE
@@ -876,10 +878,22 @@ class AutonomousAgent:
                 self.happiness = max(0, self.happiness - happiness_loss)
         
         # Decide action
-        action = self.decide_action(world_state, spatial_context)
+        chosen_action = self.decide_action(world_state, spatial_context)
+        
+        
+        # --- Phase 4 Strategic Layer ---
+        strategic_action = self.global_planner.get_strategic_action(self, world_state)
+
+        if strategic_action is not None:
+            try:
+                proposed_action = Action[strategic_action.upper()]
+            except KeyError:
+                proposed_action = chosen_action   # fallback
+        else:
+            proposed_action = chosen_action
+
         
         # ===== META-CONTROLLER INTERVENTION =====
-        proposed_action = action
         
         final_action_value, reason = self.meta_controller.evaluate(
             self,
@@ -892,6 +906,8 @@ class AutonomousAgent:
             print(f"⚠️ Meta-Controller Override → {final_action_value} ({reason})")
             # Update action variable to ensure correct execution and logging
             action = Action(final_action_value)
+        else:
+            action = proposed_action
 
         # Execute action (using final_action)
         result, spatial_bonus = self.execute_action(action, world_state, spatial_context)
