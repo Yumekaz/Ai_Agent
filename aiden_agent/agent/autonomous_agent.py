@@ -107,7 +107,7 @@ class AutonomousAgent:
         self.meta_controller = MetaController()
         self.global_planner = GlobalPlanner()
         
-        self.intention_engine = IntentionEngine()
+        self.intent_engine = IntentionEngine()
         self.current_intention = None
     
     # ========================================
@@ -853,37 +853,60 @@ class AutonomousAgent:
     # ========================================
     
     def run_cycle(self):
-        """Execute one decision-making cycle"""
+        """Execute one full Phase-6 cognitive–behavioral cycle."""
+
+        # ============================================================
+        # 0. TIME & COUNTERS
+        # ============================================================
         self.cycles_alive += 1
         self.environment.advance_time()
-        
-        # Perceive
+
+        # ============================================================
+        # 1. PERCEPTION
+        # ============================================================
         world_state, spatial_context = self.perceive_world()
-        
-        # Update motivations (with personality influence)
+
+        # ============================================================
+        # 2. MOTIVATION UPDATE
+        # ============================================================
         self.update_motivations(world_state, spatial_context)
-        
-        # ===== PHASE 5: INTENTION ENGINE =====
-        self.current_intention = self.intention_engine.evaluate(
+
+        # ============================================================
+        # 3. INTENTION ENGINE (symbolic)
+        # ============================================================
+        self.current_intention = self.intent_engine.evaluate(
             self,
-            world_state,
+            self.environment.grid_world,     # ✔ correct world
             spatial_context
         )
 
-        intention_action = self.intention_engine.suggest_action(
+        intention_action = self.intent_engine.suggest_action(
             self.current_intention,
             self,
-            world_state,
+            self.environment.grid_world,     # ✔ correct world
             spatial_context
         )
-        # ===== INTENTION DEBUG DASHBOARD =====
-        self.intention_engine.debug_dashboard()
-        
-        # Goal system
+
+        self.intent_engine.debug_dashboard()
+
+        # ============================================================
+        # 4. GLOBAL PLANNER (BFS strategic)
+        # ============================================================
+        planner_output = self.global_planner.get_strategic_action(
+            self,
+            world_state
+        )
+        # planner_output can be:
+        #   None
+        #   "rest"
+        #   { "action": "move_to_route", "next_step": "...", ... }
+
+        # ============================================================
+        # 5. GOAL MANAGER
+        # ============================================================
         agent_state = self.get_internal_state()
         spatial_state = self.get_spatial_state()
-        
-        # Create new goals if appropriate
+
         if self.goal_manager.should_create_goals(self.cycles_alive):
             new_goals = self.goal_manager.create_goals(
                 agent_state, world_state, spatial_state,
@@ -892,72 +915,89 @@ class AutonomousAgent:
             if new_goals:
                 for goal in new_goals:
                     print(f"🎯 New Goal: {goal.description}")
-        
-        # Update goal progress
+
         self.goal_manager.update_goal_progress(agent_state, spatial_state)
-        
-        # Evaluate goals
         completed, failed, goal_bonus = self.goal_manager.evaluate_goals(self.cycles_alive)
-        
+
         if completed:
             for goal in completed:
-                print(f"✅ Goal Completed: {goal.description} (+{goal.reward_bonus:.1f} reward)")
-        
+                print(f"✅ Goal Completed: {goal.description} (+{goal.reward_bonus:.1f})")
+
         if failed:
             for goal in failed:
                 print(f"❌ Goal Failed: {goal.description}")
-                # Optimism affects response to failure
                 happiness_loss = 5 * (1.0 - self.personality.optimism)
                 self.happiness = max(0, self.happiness - happiness_loss)
-        
-        # Decide action
-        chosen_action = self.decide_action(world_state, spatial_context)
-        
-        
-        # --- Phase 4 Strategic Layer ---
-        strategic_action = self.global_planner.get_strategic_action(self, world_state)
 
-        if strategic_action is not None:
-            try:
-                proposed_action = Action[strategic_action.upper()]
-            except KeyError:
-                if intention_action and intention_action.upper() in Action.__members__:
-                    proposed_action = Action[intention_action.upper()]
-                else:
-                    proposed_action = chosen_action
+        # ============================================================
+        # 6. RL ACTION CHOICE
+        # ============================================================
+        rl_action = self.decide_action(world_state, spatial_context)
+
+        # ============================================================
+        # 7. ARBITRATION (Phase-6 priority)
+        # ===============================================================
+        # 7a. Highest: BFS route packet
+        if isinstance(planner_output, dict) and planner_output.get("action") == "move_to_route":
+            proposed_action_name = planner_output["next_step"]
+
+        # 7b. Direct planner command
+        elif isinstance(planner_output, str):
+            proposed_action_name = planner_output
+
+        # 7c. Intention engine suggestion
+        elif intention_action:
+            proposed_action_name = intention_action
+
+        # 7d. Final fallback → RL
         else:
-            if intention_action and intention_action.upper() in Action.__members__:
-                proposed_action = Action[intention_action.upper()]
-            else:
-                proposed_action = chosen_action
+            proposed_action_name = rl_action.value
 
-        
-        # ===== META-CONTROLLER INTERVENTION =====
-        
-        final_action_value, reason = self.meta_controller.evaluate(
-            self,
-            proposed_action.value,
-            self.self_model
+        # Convert string → Action enum safely
+        try:
+            proposed_action = Action[proposed_action_name.upper()]
+        except KeyError:
+            proposed_action = rl_action
+
+        # ============================================================
+        # 8. META-CONTROLLER (FINAL SAFETY OVERRIDE)
+        # ============================================================
+        final_value, reason = self.meta_controller.evaluate(
+            agent=self,
+            proposed_action=proposed_action.value,  # pass lowercase string
+            planner_output=planner_output,
+            self_model=self.self_model
         )
 
         self.last_override_reason = reason
-        if final_action_value != proposed_action.value:
-            print(f"⚠️ Meta-Controller Override → {final_action_value} ({reason})")
-            # Update action variable to ensure correct execution and logging
-            action = Action(final_action_value)
-        else:
+
+        # Convert final_value → Action enum
+        try:
+            action = Action[final_value.upper()]
+        except KeyError:
             action = proposed_action
 
-        # Execute action (using final_action)
-        result, spatial_bonus = self.execute_action(action, world_state, spatial_context)
-        
-        # ===== PATCH B: RECORD STATE IN SELF-MODEL =====
+        if final_value != proposed_action.value:
+            print(f"⚠️ Meta-Controller Override → {final_value} ({reason})")
+
+        # ============================================================
+        # 9. EXECUTE ACTION
+        # ============================================================
+        result, spatial_bonus = self.execute_action(
+            action,
+            world_state,
+            spatial_context
+        )
+
+        # ============================================================
+        # 10. SELF-MODEL UPDATE
+        # ============================================================
         self.self_model.record_state(self)
-        
-        # ===== PATCH B: ANALYZE CAUSE-EFFECT PATTERNS =====
         self.self_model.analyze_cause_effect()
-        
-        # Calculate reward
+
+        # ============================================================
+        # 11. REWARD + Q-LEARNING
+        # ============================================================
         reward = self.rl_system.calculate_reward(
             result.effects,
             self.previous_state,
@@ -965,70 +1005,51 @@ class AutonomousAgent:
             spatial_bonus=spatial_bonus,
             goal_bonus=goal_bonus
         )
-        
-        # ===== PATCH C: ADD INTRINSIC REWARD INJECTION =====
+
         intrinsic_bonus = 0.0
-        
-        # Novelty reward
         if self.self_model.novelty_history:
             intrinsic_bonus += self.self_model.novelty_history[-1] * 2.0
-        
-        # Repetition penalty
         intrinsic_bonus -= self.self_model.action_repetition_index * 0.8
-        
         if self.self_model.action_repetition_index > 0.4:
             intrinsic_bonus += 1.2
-        
-        # Fatigue penalty
         if self.energy < 35:
             intrinsic_bonus -= 0.5
-        
-        # PATCH 3: Add Positive Pattern Intrinsic Reward (Missing part of PATCH C)
-        # Positive intrinsic reward from discovered helpful patterns
-        positive_bonus = 0.0
-        if self.previous_action: # Ensure action exists (not first cycle)
-            positive_bonus = self.self_model.get_positive_pattern_reward(self.previous_action)
-        intrinsic_bonus += positive_bonus
-        
-        # PATCH 4 (Part 2): Save Intrinsic Reward History
+        if self.previous_action:
+            intrinsic_bonus += self.self_model.get_positive_pattern_reward(self.previous_action)
+
+        reward += intrinsic_bonus
+
         if not hasattr(self, "intrinsic_rewards"):
             self.intrinsic_rewards = []
         self.intrinsic_rewards.append({
             "cycle": self.cycles_alive,
             "intrinsic_bonus": intrinsic_bonus
         })
-        
-        reward += intrinsic_bonus
-        
-        # Update Q-learning
+
         if self.previous_context and self.previous_action:
             self.rl_system.update_q_value(self.previous_context, self.previous_action, reward)
             self.rl_system.record_experience(self.previous_context, self.previous_action, reward)
-        
-        # Display cycle info
+
+        # ============================================================
+        # 12. DISPLAY + PERIODIC SAVES
+        # ============================================================
         self.display_status(world_state, action, result, reward)
-        
-        # Periodic personality display
-        if self.cycles_alive % 10 == 0 or (self.cycles_alive - self.last_personality_display) >= 10:
-            self.personality.display_summary()
-            self.last_personality_display = self.cycles_alive
-        
-        # Periodic self-model display
+
         if self.cycles_alive % 10 == 0:
-            print("\n" + self.self_model.get_self_awareness_summary() + "\n")
-            self.last_self_model_display = self.cycles_alive
-        
-        # Decay personality toward neutral if inactive for long periods
+            self.personality.display_summary()
+            print("\n" + self.self_model.get_self_awareness_summary())
+
         self.personality.cycles_since_activity += 1
         if self.personality.cycles_since_activity > 100:
             self.personality.decay_toward_neutral(decay_rate=0.005)
             self.personality.cycles_since_activity = 0
-        
-        # Save periodically
+
         if self.cycles_alive % 5 == 0:
             self.save_memory()
-        
+
         self.environment.clear_events()
+
+
     
     def display_status(self, world_state, action, result, reward):
         """Display current cycle status"""

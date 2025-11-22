@@ -4,210 +4,190 @@ from aiden_agent.world.terrain import TerrainType
 
 class GlobalPlanner:
     """
-    Phase-6 Strategic Planner:
-    • Forecasts future state
-    • Determines subgoals using motivations + conditions
-    • Computes safe-area routing using BFS
-    • Avoids world-boundary traps
-    • Terrain-aware high-level action suggestion
+    Phase-6 Strategic Planner (Final Corrected Version)
     """
 
+    SAFE_TERRAINS = {TerrainType.PLAINS, TerrainType.FOREST, TerrainType.RIVER}
+
     def __init__(self):
-        self.plan_memory = []
         self.last_plan = None
 
-    # ---------------------------------------------------------
-    # Forecast future agent condition (self-model patterns)
-    # ---------------------------------------------------------
-    def forecast(self, agent, world_state, steps=3):
-        energy = agent.energy
-        reward_est = 0
-        risk = 0
-
-        for p in agent.self_model.detected_patterns[-5:]:
-            desc = p.get("description", "")
-
-            if "energy" in desc:
-                energy -= p.get("avg_drop", 2)
-
-            if "low reward" in desc:
-                reward_est -= 0.5
-
-            if "danger" in desc:
-                risk += 1
-
-        return {
-            "future_energy": max(0, min(100, energy)),
-            "reward_est": reward_est,
-            "risk": risk
-        }
-
-    # ---------------------------------------------------------
-    # High-level subgoal selection
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------
+    # SUBGOAL SELECTION
+    # -------------------------------------------------------------
     def propose_subgoal(self, agent):
-
-        # Survival priority
-        if agent.energy < 35:
-            return "recover_energy"
-
-        # If stuck in bad terrain → search safe cell
         cell = agent.get_current_cell()
+
+        exploration = agent.motivation_levels.get("exploration", 0)
+        learning = agent.motivation_levels.get("learning", 0)
+
+        # Escape dangerous terrain
         if cell.terrain in {TerrainType.MOUNTAINS, TerrainType.RUINS}:
             return "find_safe_area"
 
-        # Exploration motivation
-        if agent.motivation_levels.get("exploration", 0) > 0.20:
+        # Low energy
+        if agent.energy < 25:
+            return "recover_energy"
+
+        # Learning saturation rule
+        if exploration > 0.45:
             return "find_new_cell"
 
-        # Learning drive
-        if agent.motivation_levels.get("learning", 0) > 0.20:
+        if learning > 0.55:
             return "study_knowledge"
 
         return "maintain_status"
 
-    # ---------------------------------------------------------
-    # Terrain danger scoring (not used directly but future-proof)
-    # ---------------------------------------------------------
-    def terrain_cost(self, terrain):
-        if terrain in [TerrainType.MOUNTAINS, TerrainType.RUINS]:
-            return 8  # highly dangerous
-        if terrain == TerrainType.PLAINS:
-            return 3
-        if terrain == TerrainType.FOREST:
-            return 4
-        if terrain == TerrainType.RIVER:
-            return 1  # beneficial terrain
-        return 2
-
-    # ---------------------------------------------------------
-    # BFS to find nearest non-dangerous terrain cell
-    # ---------------------------------------------------------
-    def find_nearest_safe_cell(self, agent):
+    # -------------------------------------------------------------
+    # BFS CORE ROUTER (Corrected)
+    # -------------------------------------------------------------
+    def bfs_route(self, agent, is_valid_target, avoid_danger=False):
         gw = agent.environment.grid_world
         start = (agent.position_x, agent.position_y)
 
+        queue = deque([(start, [], None)])  # (pos, path, first_step)
+        visited = {start}
+
         dangerous = {TerrainType.MOUNTAINS, TerrainType.RUINS}
 
-        queue = deque([(start, None)])  # (pos, first_direction)
-        visited = set([start])
-
         while queue:
-            (x, y), first_step = queue.popleft()
+            (x, y), path, first_step = queue.popleft()
             cell = gw.get_cell(x, y)
 
-            # Found safe terrain
-            if cell.terrain not in dangerous:
-                return first_step
+            # Found a valid target
+            if is_valid_target(x, y, cell) and (x, y) != start:
+                if first_step is None:
+                    return None
+                return {
+                    "action": first_step,   # FIXED: actual movement, no fake "move_to_route"
+                    "route": path,
+                    "distance": len(path),
+                }
 
-            neighbors = {
+            # Explore neighbors
+            for move, (nx, ny) in {
                 "move_north": (x, y - 1),
                 "move_south": (x, y + 1),
                 "move_west": (x - 1, y),
-                "move_east": (x + 1, y),
-            }
+                "move_east": (x + 1, y)
+            }.items():
 
-            for move, (nx, ny) in neighbors.items():
                 if not gw.is_valid_position(nx, ny):
                     continue
-
                 if (nx, ny) in visited:
+                    continue
+
+                ncell = gw.get_cell(nx, ny)
+
+                # Avoid dangerous terrain when required
+                if avoid_danger and ncell.terrain in dangerous:
                     continue
 
                 visited.add((nx, ny))
 
-                if first_step is None:
-                    queue.append(((nx, ny), move))
-                else:
-                    queue.append(((nx, ny), first_step))
+                # FIXED first_step logic
+                new_first_step = move if first_step is None else first_step
 
-        return None
+                queue.append(((nx, ny), path + [(nx, ny)], new_first_step))
 
-    # ---------------------------------------------------------
-    # Subgoal → strategic action
-    # ---------------------------------------------------------
-    def choose_action_for_subgoal(self, subgoal, agent):
+        return None  # BFS failed
 
-        # 1. Rest if energy critical
-        if subgoal == "recover_energy":
-            return "rest"
+    # -------------------------------------------------------------
+    # SAFE AREA ROUTING
+    # -------------------------------------------------------------
+    def route_to_safe_area(self, agent):
+        def safe(x, y, cell):
+            return cell.terrain in self.SAFE_TERRAINS
 
-        # 2. Move toward safe area
-        if subgoal == "find_safe_area":
-            direction = self.find_nearest_safe_cell(agent)
-            if direction:
-                return direction
-            return "move_random"
+        return self.bfs_route(agent, safe, avoid_danger=True)
 
-        # ---------------------------------------------------------
-        # 3. HARD BOUNDARY ESCAPE (critical for exploration)
-        # ---------------------------------------------------------
-        gw = agent.environment.grid_world
-        max_x = gw.width - 1
-        max_y = gw.height - 1
+    # -------------------------------------------------------------
+    # UNEXPLORED CELL ROUTING (Corrected)
+    # -------------------------------------------------------------
+    def route_to_unexplored(self, agent):
+        def unseen(x, y, cell):
+            # FIXED: handle discovered/visited differences
+            discovered = getattr(cell, "discovered", False)
+            visited = getattr(cell, "visit_count", 0) > 0
+            return not discovered and not visited
 
-        x = agent.position_x
-        y = agent.position_y
+        return self.bfs_route(agent, unseen, avoid_danger=True)
 
-        if y == 0 and gw.is_valid_position(x, y + 1):
-            return "move_south"
+    # -------------------------------------------------------------
+    # LEARNING TILE ROUTING
+    # -------------------------------------------------------------
+    def route_to_learning_tile(self, agent):
+        def stable(x, y, cell):
+            return cell.terrain in {TerrainType.PLAINS, TerrainType.RIVER}
+        return self.bfs_route(agent, stable, avoid_danger=True)
 
-        if y == max_y and gw.is_valid_position(x, y - 1):
-            return "move_north"
+    # -------------------------------------------------------------
+    # GOAL ROUTING
+    # -------------------------------------------------------------
+    def route_to_goal(self, agent):
+        goal = agent.goal_manager.get_active_goal()
+        if not goal:
+            return None
 
-        if x == 0 and gw.is_valid_position(x + 1, y):
-            return "move_east"
+        if not getattr(goal, "routing_required", False):
+            return None
 
-        if x == max_x and gw.is_valid_position(x - 1, y):
-            return "move_west"
+        route_target = getattr(goal, "route_target", None)
+        if not isinstance(route_target, tuple):
+            return None
 
-        # ---------------------------------------------------------
-        # 4. Find undiscovered neighbor cells
-        # ---------------------------------------------------------
-        if subgoal == "find_new_cell":
-            moves = []
+        tx, ty = route_target
 
-            # north
-            if gw.is_valid_position(x, y - 1) and not gw.get_cell(x, y - 1).discovered:
-                moves.append("move_north")
+        def hit(x, y, cell):
+            return (x, y) == (tx, ty)
 
-            # south
-            if gw.is_valid_position(x, y + 1) and not gw.get_cell(x, y + 1).discovered:
-                moves.append("move_south")
+        return self.bfs_route(agent, hit, avoid_danger=goal.safe_routing_only)
 
-            # west
-            if gw.is_valid_position(x - 1, y) and not gw.get_cell(x - 1, y).discovered:
-                moves.append("move_west")
-
-            # east
-            if gw.is_valid_position(x + 1, y) and not gw.get_cell(x + 1, y).discovered:
-                moves.append("move_east")
-
-            if moves:
-                return moves[0]
-
-            # fallback: let RL handle open exploration
-            return "explore"
-
-        # 5. Knowledge gain
-        if subgoal == "study_knowledge":
-            return "study"
-
-        # Default
-        return None
-
-    # ---------------------------------------------------------
-    # Master strategic planner entry point
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------
+    # MAIN STRATEGIC DECISION
+    # -------------------------------------------------------------
     def get_strategic_action(self, agent, world_state):
-        forecast = self.forecast(agent, world_state)
+        cell = agent.get_current_cell()
         subgoal = self.propose_subgoal(agent)
-        strategic_action = self.choose_action_for_subgoal(subgoal, agent)
 
-        self.last_plan = {
-            "forecast": forecast,
-            "subgoal": subgoal,
-            "suggestion": strategic_action
-        }
+        # 1. Escape dangerous terrain immediately
+        if cell.terrain in {TerrainType.MOUNTAINS, TerrainType.RUINS}:
+            plan = self.route_to_safe_area(agent)
+            self.last_plan = plan
+            return plan or {"action": "rest"}
 
-        return strategic_action
+        # 2. Goal routing
+        goal_route = self.route_to_goal(agent)
+        if goal_route:
+            self.last_plan = goal_route
+            return goal_route
+
+        # 3. Recover energy
+        if subgoal == "recover_energy":
+            plan = {"action": "rest"}
+            self.last_plan = plan
+            return plan
+
+        # 4. Find safe area (fixed check)
+        if subgoal == "find_safe_area" and cell.terrain not in self.SAFE_TERRAINS:
+            plan = self.route_to_safe_area(agent)
+            self.last_plan = plan
+            return plan
+
+        # 5. Explore
+        if subgoal == "find_new_cell":
+            plan = self.route_to_unexplored(agent)
+            if plan:
+                self.last_plan = plan
+                return plan
+
+        # 6. Learn
+        if subgoal == "study_knowledge":
+            plan = self.route_to_learning_tile(agent)
+            if plan:
+                self.last_plan = plan
+                return plan
+
+        # 7. No strategic suggestion
+        self.last_plan = None
+        return None
